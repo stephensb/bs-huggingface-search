@@ -31,6 +31,18 @@ const QUANT_TAGS = new Set(['4-bit', '8-bit', '2-bit', '3-bit', '5-bit', '6-bit'
   'autoround', 'auto-round', 'aqlm', 'eetq', 'quanto', 'torchao', 'onnx', 'openvino', 'coreml', 'tensorrt', 'nf4']);
 const QUANT_NAME_RE = /(gguf|awq|gptq|exl[23]|hqq|bnb|nf4|fp8|nvfp4|mxfp4|w4a16|w8a8|w8a16|int[48]\b|[-_.](q[2-8]|iq[1-4]|[2-8]bit|[48]-?bit)\b|-(Q[2-8]_|IQ[1-4]_)|quantized|\bmlx\b|-\d+bit)/i;
 
+// Parameter count parsed from the repo name: "27B", "30B-A3B" (total, not active), "8x7B", "360M", "E4B".
+// Used when the Hub metadata is missing or clearly describes a different file (e.g. a draft/MTP GGUF).
+const NAME_PARAMS_RE = /(?<![\d.])(?:(\d+)x)?(\d+(?:\.\d+)?)([bBmM])(?![a-z0-9])/g;
+function paramsFromName(name) {
+  let best = null;
+  for (const m of name.matchAll(NAME_PARAMS_RE)) {
+    const n = +m[2] * (m[1] ? +m[1] : 1) * (m[3].toLowerCase() === 'b' ? 1e9 : 1e6);
+    if (n >= 1e6 && n <= 5e12 && (best == null || n > best)) best = n;
+  }
+  return best;
+}
+
 const $ = (id) => document.getElementById(id);
 const fmtInt = (n) => n == null ? '' : Math.round(n).toLocaleString('en-US');
 const fmtCompact = (n) => n == null ? '' : n >= 1e9 ? (n / 1e9).toFixed(n >= 1e10 ? 0 : 1) + 'B' : n >= 1e6 ? (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + 'M' : n >= 1e4 ? (n / 1e3).toFixed(0) + 'k' : fmtInt(n);
@@ -46,7 +58,7 @@ const daysAgo = (d, now) => d ? (now - d.getTime()) / 86400000 : null;
 const COLUMNS = [
   { key: 'id', label: 'model', get: (r) => r.id, type: 'str', on: true, cls: 'id' },
   { key: 'author', label: 'author', get: (r) => r.author, type: 'str', on: false },
-  { key: 'params', label: 'params', get: (r) => r.params, type: 'num', fmt: fmtParams, on: true, title: 'Parameter count from safetensors metadata, else GGUF metadata' },
+  { key: 'params', label: 'params', get: (r) => r.params, type: 'num', fmt: fmtParams, on: true, title: 'Parameter count from safetensors metadata, else GGUF metadata; ~ marks a value parsed from the model name (metadata missing or describing a different file)' },
   { key: 'downloads', label: 'dl 30d', get: (r) => r.downloads, type: 'num', fmt: fmtCompact, on: true },
   { key: 'downloadsAllTime', label: 'dl total', get: (r) => r.downloadsAllTime, type: 'num', fmt: fmtCompact, on: true },
   { key: 'likes', label: 'likes', get: (r) => r.likes, type: 'num', fmt: fmtCompact, on: true },
@@ -92,7 +104,11 @@ function normalize(m, now) {
   const modified = m.lastModified ? new Date(m.lastModified) : null;
   const st = m.safetensors && m.safetensors.total;
   const gg = m.gguf;
-  const params = st || (gg && gg.total) || null;
+  const fromName = paramsFromName(m.id.split('/').pop() || '');
+  let params = st || (gg && gg.total) || null;
+  let paramsSrc = st ? 'safetensors' : params ? 'gguf' : null;
+  // GGUF metadata on the Hub comes from one file in the repo; multi-file repos (draft heads, mmproj) mislead badly.
+  if (!st && fromName && (!params || params < fromName / 2 || params > fromName * 2)) { params = fromName; paramsSrc = 'name'; }
   const license = tags.filter((t) => t.startsWith('license:')).map((t) => t.slice(8)).join(', ') || null;
   const langs = tags.filter((t) => !t.includes(':') && LANG_RE.test(t) && !NOT_LANG.has(t));
   const datasets = tags.filter((t) => t.startsWith('dataset:')).map((t) => t.slice(8));
@@ -128,7 +144,7 @@ function normalize(m, now) {
     gated: m.gated && m.gated !== false ? String(m.gated) : null,
     likes: m.likes ?? 0, trending: m.trendingScore ?? 0, downloads: dl30, downloadsAllTime: dlAll,
     created, modified, ageDays,
-    params, paramsSrc: st ? 'safetensors' : gg && gg.total ? 'gguf' : null,
+    params, paramsSrc, paramsMeta: st || (gg && gg.total) || null,
     dtypes: m.safetensors ? Object.keys(m.safetensors.parameters || {}) : [],
     license, langs, datasets, arxiv, arch, archs,
     library: m.library_name || null, pipeline: m.pipeline_tag || null,
@@ -440,7 +456,8 @@ function cell(c, r) {
     const pills = (r.gated ? `<span class="pill gated">gated</span>` : '') + (r.providersLive ? `<span class="pill live">${r.providersLive} live</span>` : '');
     return `<td class="id"><a href="https://huggingface.co/${esc(r.id)}" target="_blank" rel="noopener">${esc(r.id)}</a>${pills}</td>`;
   }
-  const txt = c.fmt ? c.fmt(v) : (v ?? '');
+  let txt = c.fmt ? c.fmt(v) : (v ?? '');
+  if (c.key === 'params' && r.paramsSrc === 'name' && txt) txt = '~' + txt;
   const title = c.type === 'num' && v != null ? (Number.isInteger(v) ? fmtInt(v) : v.toFixed(3)) : txt;
   return `<td class="${c.type === 'num' ? 'num' : ''}" title="${esc(title)}">${esc(txt)}</td>`;
 }
@@ -457,7 +474,9 @@ function detail(r) {
     `<a href="https://huggingface.co/models?other=base_model:quantized:${encodeURIComponent(r.id)}" target="_blank" rel="noopener">quantizations</a>` +
     `<button type="button" class="copy" data-id="${esc(r.id)}">copy id</button></div>` +
     `<dl class="detail-grid">` +
-    row('params', r.params ? `${fmtInt(r.params)} (${r.paramsSrc}${dt ? ', ' + dt : ''})` : '') +
+    row('params', r.params ? (r.paramsSrc === 'name'
+      ? `~${fmtInt(r.params)} parsed from the name${r.paramsMeta ? `; Hub GGUF metadata says ${fmtInt(r.paramsMeta)}, which describes a single file in the repo (e.g. a draft/MTP or mmproj GGUF)` : '; no size metadata on the Hub'}`
+      : `${fmtInt(r.params)} (${r.paramsSrc}${dt ? ', ' + dt : ''})`) : '') +
     row('architectures', r.archs.length ? esc(r.archs.join(', ')) : '') +
     row('base models', rels) +
     row('gguf', r.hasGguf ? `${fmtBytes(r.ggufSize)}${r.ctx ? ', ctx ' + fmtInt(r.ctx) : ''}` : '') +

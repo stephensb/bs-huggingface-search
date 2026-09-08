@@ -27,7 +27,9 @@ python3 -m http.server 8765
 ## Filters
 
 - Name include / exclude regex (e.g. exclude `gguf|awq|gptq` to drop quantized re-uploads)
-- Parameter count range in billions (from safetensors metadata, GGUF metadata as fallback)
+- Parameter count range in billions (from safetensors metadata, GGUF metadata as fallback, or
+  parsed from the name such as `27B`, `30B-A3B`, `8x7B` when metadata is missing or clearly
+  describes a different file; those values are shown with a `~`)
 - Minimums for 30-day downloads, all-time downloads, likes, trending score, GGUF context length, live providers
 - Created / modified date ranges, with quick "created in last N days" buttons
 - Gated, quantized, has safetensors, has GGUF, custom code, has a live inference provider
@@ -77,6 +79,10 @@ fetches from the network.
 - The Hub does not filter by parameter count, date or download thresholds server-side,
   which is why the app fetches a slice and filters locally.
 - `search` matches substrings of the repo name only, not the model card.
+- The Hub's GGUF metadata (parameter count, context length, size) describes a single file
+  in the repo. In multi-file repos it often picks a draft/MTP head or mmproj file, so a 27B
+  repo can report 1.9B parameters. The app cross-checks against the name and overrides
+  when they disagree by more than 2x.
 - Unauthenticated rate limit is 500 requests per 5 minutes; each fetch uses one request
   per 1,000 models.
 - The `arch` checkbox requests `config.json` metadata (architecture, model_type). It adds
