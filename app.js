@@ -394,7 +394,7 @@ function pickHeaderFile(r) {
   const cands = r.ggufMain.filter((f) => !/-\d{5}-of-\d{5}\.gguf$/i.test(f) || /-00001-of-/i.test(f));
   if (!cands.length) return null;
   const sizes = r.fileCheck ? r.fileCheck.quants : {};
-  return cands.map((f) => ({ f, s: sizes[quantLabel(f) || 'other'] || (1 / (bpwFor(quantLabel(f) || '') || 99)) * 1e12 }))
+  return cands.map((f) => ({ f, s: sizes[quantLabel(f) || 'other'] || (bpwFor(quantLabel(f) || '') || 99) * 1e9 }))
     .sort((a, b) => a.s - b.s)[0].f;
 }
 async function readHeader(r, signal) {
