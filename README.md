@@ -6,7 +6,8 @@ sorting and filtering the official site does not offer. The browser talks straig
 
 ## Run
 
-Open `index.html` directly in a browser, or serve the folder:
+Use the hosted copy at **https://stephensb.github.io/bs-huggingface-search/**, open
+`index.html` directly in a browser, or serve the folder:
 
 ```sh
 python3 -m http.server 8765
