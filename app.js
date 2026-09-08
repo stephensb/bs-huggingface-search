@@ -4,7 +4,7 @@
 const API = 'https://huggingface.co/api/models';
 const EXPAND = ['downloads', 'downloadsAllTime', 'likes', 'lastModified', 'createdAt', 'library_name',
   'pipeline_tag', 'tags', 'safetensors', 'gated', 'trendingScore', 'author', 'gguf', 'baseModels',
-  'inferenceProviderMapping'];
+  'inferenceProviderMapping', 'siblings'];
 const PAGE = 1000;
 const SEP = '';
 
@@ -43,6 +43,19 @@ function paramsFromName(name) {
   return best;
 }
 
+// GGUF files that are not the model weights: vision projectors, speculative-decoding draft heads, adapters.
+const AUX_GGUF_RE = /mmproj|projector|draft|mtp|dflash|eagle|specul|medusa|-lora|adapter/i;
+const QUANT_RE = /(IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_K(?:_[SMLPX]+)?|Q[2-8]_[01]|TQ[12]_0|BF16|F16|F32|MXFP4)/i;
+// Approximate bits per weight of llama.cpp quant types, used to estimate parameter counts from file sizes.
+const BPW = { F32: 32, BF16: 16, F16: 16, Q8_0: 8.5, Q6_K: 6.56, Q5_K_M: 5.69, Q5_K_S: 5.52, Q5_1: 6, Q5_0: 5.5, Q4_K_M: 4.85, Q4_K_S: 4.58,
+  Q4_1: 5, Q4_0: 4.5, IQ4_NL: 4.5, IQ4_XS: 4.25, MXFP4: 4.25, Q3_K_L: 4.03, Q3_K_M: 3.91, Q3_K_S: 3.5, IQ3_M: 3.7, IQ3_S: 3.5, IQ3_XS: 3.3,
+  IQ3_XXS: 3.1, Q2_K: 3.35, Q2_K_S: 3.0, IQ2_M: 2.7, IQ2_S: 2.5, IQ2_XS: 2.31, IQ2_XXS: 2.06, IQ1_M: 1.75, IQ1_S: 1.56, TQ2_0: 2.06, TQ1_0: 1.69 };
+const BPW_FALLBACK = { Q8: 8.5, Q6: 6.6, Q5: 5.7, Q4: 4.8, Q3: 3.9, Q2: 3.2, IQ4: 4.4, IQ3: 3.5, IQ2: 2.5, IQ1: 1.7 };
+const quantLabel = (path) => { const m = QUANT_RE.exec(path.split('/').pop()); return m ? m[1].toUpperCase() : null; };
+const bpwFor = (label) => BPW[label] || BPW_FALLBACK[(/^(IQ\d|Q\d)/.exec(label) || [])[1]] || null;
+const isAuxGguf = (path) => AUX_GGUF_RE.test(path);
+const basename = (path) => path.split('/').pop();
+
 const $ = (id) => document.getElementById(id);
 const fmtInt = (n) => n == null ? '' : Math.round(n).toLocaleString('en-US');
 const fmtCompact = (n) => n == null ? '' : n >= 1e9 ? (n / 1e9).toFixed(n >= 1e10 ? 0 : 1) + 'B' : n >= 1e6 ? (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + 'M' : n >= 1e4 ? (n / 1e3).toFixed(0) + 'k' : fmtInt(n);
@@ -75,7 +88,9 @@ const COLUMNS = [
   { key: 'license', label: 'license', get: (r) => r.license, type: 'str', on: true },
   { key: 'quant', label: 'quant', get: (r) => r.quant, type: 'str', on: false, title: 'Detected quantization format' },
   { key: 'ctx', label: 'gguf ctx', get: (r) => r.ctx, type: 'num', fmt: fmtCompact, on: false, title: 'Context length from GGUF metadata' },
-  { key: 'ggufSize', label: 'gguf size', get: (r) => r.ggufSize, type: 'num', fmt: fmtBytes, on: false, title: 'Total size of GGUF files in the repo' },
+  { key: 'ggufSize', label: 'gguf size', get: (r) => r.ggufSize, type: 'num', fmt: fmtBytes, on: false, title: 'Size of the smallest main GGUF quant (after check files), else the single file the Hub reports' },
+  { key: 'quants', label: 'gguf quants', get: (r) => r.quants.join(' '), type: 'str', on: false, title: 'Quant variants of the main model weights present in the repo' },
+  { key: 'repoBytes', label: 'repo size', get: (r) => r.repoBytes, type: 'num', fmt: fmtBytes, on: false, title: 'Total size of all files (after check files)' },
   { key: 'providers', label: 'providers', get: (r) => r.providersLive, type: 'num', fmt: fmtInt, on: false, title: 'Number of live inference providers' },
   { key: 'base', label: 'base model', get: (r) => r.baseIds[0] || '', type: 'str', on: false },
   { key: 'relation', label: 'relation', get: (r) => r.relation, type: 'str', on: false, title: 'How this repo relates to its base model' },
@@ -95,6 +110,7 @@ const state = {
   open: new Set(),   // expanded row ids
   fetchedWith: '',   // fetch params signature of current rows
   abort: null,
+  fcAbort: null,     // AbortController of a running batch file check
 };
 
 // ---------- Normalization ----------
@@ -107,8 +123,6 @@ function normalize(m, now) {
   const fromName = paramsFromName(m.id.split('/').pop() || '');
   let params = st || (gg && gg.total) || null;
   let paramsSrc = st ? 'safetensors' : params ? 'gguf' : null;
-  // GGUF metadata on the Hub comes from one file in the repo; multi-file repos (draft heads, mmproj) mislead badly.
-  if (!st && fromName && (!params || params < fromName / 2 || params > fromName * 2)) { params = fromName; paramsSrc = 'name'; }
   const license = tags.filter((t) => t.startsWith('license:')).map((t) => t.slice(8)).join(', ') || null;
   const langs = tags.filter((t) => !t.includes(':') && LANG_RE.test(t) && !NOT_LANG.has(t));
   const datasets = tags.filter((t) => t.startsWith('dataset:')).map((t) => t.slice(8));
@@ -134,6 +148,14 @@ function normalize(m, now) {
   if (nm) { const q = nm[1].toLowerCase(); quant = quant ? (quant === q ? quant : quant + '/' + q) : q; }
   if (!quant && gg) quant = 'gguf';
   if (!quant && rel.quantized) quant = 'quantized';
+  // GGUF metadata on the Hub comes from one file in the repo; multi-file repos (draft heads, mmproj) mislead badly.
+  if (!st && fromName && (!params || params < fromName / 2 || params > fromName * 2)) { params = fromName; paramsSrc = 'name'; }
+  // Safetensors counts of packed quantized weights (AWQ/GPTQ int32 packing, MLX 4-bit) undercount by up to 8x.
+  if (st && fromName && quant && st < fromName / 2) { params = fromName; paramsSrc = 'name'; }
+  const files = (Array.isArray(m.siblings) ? m.siblings : []).map((x) => x.rfilename).filter(Boolean);
+  const ggufAll = files.filter((f) => /\.gguf$/i.test(f));
+  const ggufMain = ggufAll.filter((f) => !isAuxGguf(f));
+  const quants = [...new Set(ggufMain.map(quantLabel).filter(Boolean))].sort((a, b) => (bpwFor(b) || 0) - (bpwFor(a) || 0));
   const ipm = Array.isArray(m.inferenceProviderMapping) ? m.inferenceProviderMapping : [];
   const providersLive = ipm.filter((p) => p.status === 'live').map((p) => p.provider);
   const ageDays = daysAgo(created, now);
@@ -148,8 +170,10 @@ function normalize(m, now) {
     dtypes: m.safetensors ? Object.keys(m.safetensors.parameters || {}) : [],
     license, langs, datasets, arxiv, arch, archs,
     library: m.library_name || null, pipeline: m.pipeline_tag || null,
-    tags, tagSet, hasSafetensors: !!m.safetensors, hasGguf: !!gg,
-    ggufSize: gg ? gg.totalFileSize ?? null : null, ctx: gg ? gg.context_length ?? null : null,
+    tags, tagSet, hasSafetensors: !!m.safetensors || files.some((f) => /\.safetensors$/i.test(f)), hasGguf: !!gg || ggufAll.length > 0,
+    ggufSize: gg ? gg.totalFileSize ?? null : null, ggufSizeMax: null, ctx: gg ? gg.context_length ?? null : null,
+    files, ggufMain, ggufAux: ggufAll.filter(isAuxGguf), quants, hasMmproj: ggufAll.some((f) => /mmproj|projector/i.test(f)),
+    fileCheck: null, repoBytes: null,
     quant, rel, relation, baseIds, providersLive: providersLive.length, providers: providersLive,
     customCode: tagSet.has('custom_code'),
     momentum: dlAll ? Math.min(1, (dl30 || 0) / dlAll) : null,
@@ -161,26 +185,30 @@ function normalize(m, now) {
 // ---------- IndexedDB cache ----------
 // Raw API results are cached per fetch signature so repeated queries load instantly and offline.
 // Unavailable storage (Safari on file://, private windows, blocked site data) silently degrades to network-only.
-const CACHE_DB = 'hf-explorer', CACHE_STORE = 'fetches', CACHE_MAX = 25;
+const CACHE_DB = 'hf-explorer', CACHE_STORE = 'fetches', FILES_STORE = 'files', CACHE_MAX = 25;
 let dbPromise = null;
 function openDb() {
   if (dbPromise) return dbPromise;
   dbPromise = new Promise((res) => {
     try {
       if (typeof indexedDB === 'undefined') return res(null);
-      const r = indexedDB.open(CACHE_DB, 1);
-      r.onupgradeneeded = () => r.result.createObjectStore(CACHE_STORE, { keyPath: 'key' }).createIndex('fetchedAt', 'fetchedAt');
+      const r = indexedDB.open(CACHE_DB, 2);
+      r.onupgradeneeded = () => {
+        const db = r.result;
+        if (!db.objectStoreNames.contains(CACHE_STORE)) db.createObjectStore(CACHE_STORE, { keyPath: 'key' }).createIndex('fetchedAt', 'fetchedAt');
+        if (!db.objectStoreNames.contains(FILES_STORE)) db.createObjectStore(FILES_STORE, { keyPath: 'key' });
+      };
       r.onsuccess = () => res(r.result);
       r.onerror = r.onblocked = () => res(null);
     } catch { res(null); }
   });
   return dbPromise;
 }
-function idb(mode, fn) {
+function idb(mode, fn, store = CACHE_STORE) {
   return openDb().then((db) => db ? new Promise((res, rej) => {
     try {
-      const tx = db.transaction(CACHE_STORE, mode);
-      const req = fn(tx.objectStore(CACHE_STORE));
+      const tx = db.transaction(store, mode);
+      const req = fn(tx.objectStore(store));
       tx.oncomplete = () => res(req ? req.result : undefined);
       tx.onerror = tx.onabort = () => rej(tx.error);
     } catch (e) { rej(e); }
@@ -195,14 +223,19 @@ async function cachePut(entry) {
   } catch (e) { console.warn('cache write failed', e); }
   updateCacheInfo();
 }
-const cacheClear = () => idb('readwrite', (s) => s.clear()).catch(() => undefined).then(updateCacheInfo);
+const cacheClear = () => Promise.all([idb('readwrite', (s) => s.clear()), idb('readwrite', (s) => s.clear(), FILES_STORE)]).catch(() => undefined).then(updateCacheInfo);
+const fcKey = (r) => r.id + '@' + (r.modified ? r.modified.toISOString() : '');
+const fcGet = (r) => idb('readonly', (s) => s.get(fcKey(r)), FILES_STORE).catch(() => undefined);
+const fcPut = (r, info) => idb('readwrite', (s) => s.put({ key: fcKey(r), ...info }), FILES_STORE).catch(() => undefined);
+const fcAll = () => idb('readonly', (s) => s.getAll(), FILES_STORE).catch(() => undefined);
 async function updateCacheInfo() {
   const el = $('cacheInfo');
   const n = await idb('readonly', (s) => s.count()).catch(() => undefined);
   if (n === undefined) { el.textContent = '(no local cache available in this browser)'; return; }
+  const nf = await idb('readonly', (s) => s.count(), FILES_STORE).catch(() => 0);
   let size = '';
   try { const est = await navigator.storage.estimate(); if (est.usage) size = ', ' + fmtBytes(est.usage); } catch { /* ignore */ }
-  el.innerHTML = n ? `cache: ${n} quer${n === 1 ? 'y' : 'ies'}${size} · <button type="button" class="link" id="clearCache">clear</button>` : '';
+  el.innerHTML = n || nf ? `cache: ${n} quer${n === 1 ? 'y' : 'ies'}, ${nf} file check${nf === 1 ? '' : 's'}${size} · <button type="button" class="link" id="clearCache">clear</button>` : '';
   el.querySelector('#clearCache')?.addEventListener('click', cacheClear);
 }
 const fmtAgo = (ms) => { const m = ms / 60000; return m < 1 ? 'just now' : m < 60 ? `${Math.round(m)} min ago` : m < 48 * 60 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} days ago`; };
@@ -240,9 +273,14 @@ function nextCursor(res) {
   if (!m) return null;
   try { return new URL(m[1]).searchParams.get('cursor'); } catch { return null; }
 }
-function loadRows(raw, key, fetchedAt, note) {
+async function loadRows(raw, key, fetchedAt, note) {
   const now = Date.now();
   state.rows = raw.map((m) => normalize(m, now));
+  const cached = await fcAll();
+  if (cached && cached.length) {
+    const byKey = new Map(cached.map((c) => [c.key, c]));
+    for (const r of state.rows) { const c = byKey.get(fcKey(r)); if (c) applyFileCheck(r, c); }
+  }
   state.fetchedWith = key;
   state.open.clear();
   state.page = 0;
@@ -258,7 +296,7 @@ async function doFetch(force) {
   const key = JSON.stringify(p);
   if (!force) {
     const hit = await cacheGet(key);
-    if (hit && Array.isArray(hit.raw)) { loadRows(hit.raw, key, hit.fetchedAt, 'loaded from local cache'); return; }
+    if (hit && Array.isArray(hit.raw)) { await loadRows(hit.raw, key, hit.fetchedAt, 'loaded from local cache'); return; }
   }
   const ctrl = new AbortController();
   state.abort = ctrl;
@@ -285,7 +323,7 @@ async function doFetch(force) {
     }
     const raw = all.slice(0, p.limit);
     const fetchedAt = Date.now();
-    loadRows(raw, key, fetchedAt, `fetched in ${((performance.now() - t0) / 1000).toFixed(1)}s, ordered by ${p.sort} server-side${cursor ? ', more available' : ', exhausted'}`);
+    await loadRows(raw, key, fetchedAt, `fetched in ${((performance.now() - t0) / 1000).toFixed(1)}s, ordered by ${p.sort} server-side${cursor ? ', more available' : ', exhausted'}`);
     cachePut({ key, params: p, fetchedAt, count: raw.length, raw });
   } catch (e) {
     if (e.name === 'AbortError') setStatus(`Cancelled. Kept ${state.rows.length.toLocaleString()} previously fetched models.`);
@@ -298,6 +336,104 @@ async function doFetch(force) {
 }
 function setStatus(msg, err) { const s = $('status'); s.textContent = msg; s.classList.toggle('err', !!err); }
 
+// ---------- File checks (tree API) and exact GGUF header reads ----------
+async function fetchTree(id, signal) {
+  const out = [];
+  let url = `https://huggingface.co/api/models/${id}/tree/main?recursive=true&limit=1000`;
+  for (let page = 0; url && page < 5; page++) {
+    const res = await fetch(url, { signal, headers: { Accept: 'application/json' } });
+    if (res.status === 429) throw new Error('rate limited by the Hub (429); wait a few minutes');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    out.push(...(await res.json()));
+    url = nextCursor(res) ? url.replace(/&cursor=[^&]*/, '') + '&cursor=' + encodeURIComponent(nextCursor(res)) : null;
+  }
+  return out;
+}
+function summarizeTree(tree) {
+  const files = tree.filter((f) => f.type === 'file');
+  const info = { checkedAt: Date.now(), totalBytes: 0, stBytes: 0, quants: {}, auxBytes: 0, nFiles: files.length };
+  for (const f of files) {
+    const size = f.size || 0;
+    info.totalBytes += size;
+    if (/\.gguf$/i.test(f.path)) {
+      if (isAuxGguf(f.path)) { info.auxBytes += size; continue; }
+      const q = quantLabel(f.path) || 'other';
+      info.quants[q] = (info.quants[q] || 0) + size;
+    } else if (/\.safetensors$/i.test(f.path) && !/mmproj|projector/i.test(f.path)) info.stBytes += size;
+  }
+  let best = null;
+  for (const [q, bytes] of Object.entries(info.quants)) { const b = bpwFor(q); if (b && (!best || b > best.bpw)) best = { q, bytes, bpw: b }; }
+  if (best) { info.estParams = Math.round(best.bytes * 8 / best.bpw); info.estFrom = best.q; }
+  const sizes = Object.values(info.quants).filter((b) => b > 0);
+  if (sizes.length) { info.ggufMin = Math.min(...sizes); info.ggufMax = Math.max(...sizes); }
+  return info;
+}
+function applyFileCheck(r, info) {
+  r.fileCheck = info;
+  r.repoBytes = info.totalBytes;
+  if (info.ggufMin) { r.ggufSize = info.ggufMin; r.ggufSizeMax = info.ggufMax; }
+  const q = Object.keys(info.quants || {}).filter((k) => k !== 'other');
+  if (q.length) r.quants = q.sort((a, b) => (bpwFor(b) || 0) - (bpwFor(a) || 0));
+  if (info.header && info.header.params) {
+    r.params = info.header.params; r.paramsSrc = 'header';
+    if (info.header.contextLength) r.ctx = info.header.contextLength;
+  } else if (r.paramsSrc !== 'safetensors' && info.estParams) {
+    r.params = info.estParams; r.paramsSrc = 'files';
+  }
+}
+async function checkFiles(r, signal) {
+  const cached = await fcGet(r);
+  if (cached && cached.checkedAt) { applyFileCheck(r, cached); return cached; }
+  const info = summarizeTree(await fetchTree(r.id, signal));
+  await fcPut(r, info);
+  applyFileCheck(r, info);
+  return info;
+}
+function pickHeaderFile(r) {
+  // Smallest main GGUF (cheapest to range-read; the header is the same for every quant). For shards, the first one.
+  const cands = r.ggufMain.filter((f) => !/-\d{5}-of-\d{5}\.gguf$/i.test(f) || /-00001-of-/i.test(f));
+  if (!cands.length) return null;
+  const sizes = r.fileCheck ? r.fileCheck.quants : {};
+  return cands.map((f) => ({ f, s: sizes[quantLabel(f) || 'other'] || (1 / (bpwFor(quantLabel(f) || '') || 99)) * 1e12 }))
+    .sort((a, b) => a.s - b.s)[0].f;
+}
+async function readHeader(r, signal) {
+  const file = pickHeaderFile(r);
+  if (!file) throw new Error('no main GGUF file in this repo');
+  const h = await GGUF.readHeader(`https://huggingface.co/${r.id}/resolve/main/${file.split('/').map(encodeURIComponent).join('/')}`, { signal });
+  const header = { file, params: h.params, nTensors: h.nTensors, arch: h.arch, name: h.name, sizeLabel: h.sizeLabel, fileType: h.fileType,
+    contextLength: h.contextLength, blockCount: h.blockCount, expertCount: h.expertCount, headerBytes: h.headerBytes, readAt: Date.now() };
+  const info = { ...(r.fileCheck || (await fcGet(r)) || { quants: {}, totalBytes: null }), header };
+  await fcPut(r, info);
+  applyFileCheck(r, info);
+  return header;
+}
+async function checkFilesBatch() {
+  const btn = $('checkFiles');
+  if (state.fcAbort) { state.fcAbort.abort(); return; }
+  const todo = state.view.filter((r) => !r.fileCheck || !r.fileCheck.checkedAt).slice(0, 300);
+  if (!todo.length) { setStatus('All filtered models already have file checks.'); return; }
+  const ctrl = new AbortController();
+  state.fcAbort = ctrl;
+  btn.textContent = 'stop';
+  let done = 0, failed = 0;
+  const t0 = performance.now();
+  const worker = async () => {
+    while (todo.length && !ctrl.signal.aborted) {
+      const r = todo.shift();
+      try { await checkFiles(r, ctrl.signal); done++; }
+      catch (e) { if (e.name === 'AbortError') return; failed++; if (/429/.test(e.message)) { ctrl.abort(); setStatus('Stopped: ' + e.message, true); return; } }
+      setStatus(`Checking files… ${done} done${failed ? `, ${failed} failed` : ''}, ${todo.length} left`);
+    }
+  };
+  await Promise.all([1, 2, 3, 4].map(worker));
+  if (!ctrl.signal.aborted || !/Stopped/.test($('status').textContent)) setStatus(`File check: ${done} models in ${((performance.now() - t0) / 1000).toFixed(1)}s${failed ? `, ${failed} failed` : ''}${ctrl.signal.aborted ? ' (stopped)' : ''}.`);
+  state.fcAbort = null;
+  btn.textContent = 'check files';
+  apply();
+  updateCacheInfo();
+}
+
 // ---------- Facets ----------
 const FACETS = [
   { key: 'license', label: 'license', get: (r) => r.license ? [r.license] : ['(none)'] },
@@ -305,6 +441,7 @@ const FACETS = [
   { key: 'pipeline', label: 'task', get: (r) => [r.pipeline || '(none)'] },
   { key: 'library', label: 'library', get: (r) => [r.library || '(none)'] },
   { key: 'quant', label: 'quantization', get: (r) => [r.quant || '(none)'] },
+  { key: 'quants', label: 'gguf quant available', get: (r) => r.quants.length ? r.quants : ['(none)'] },
   { key: 'dtypes', label: 'dtype (safetensors)', get: (r) => r.dtypes.length ? r.dtypes : ['(unknown)'] },
   { key: 'langs', label: 'language', get: (r) => r.langs.length ? r.langs : ['(none)'] },
   { key: 'author', label: 'author', get: (r) => [r.author] },
@@ -457,7 +594,8 @@ function cell(c, r) {
     return `<td class="id"><a href="https://huggingface.co/${esc(r.id)}" target="_blank" rel="noopener">${esc(r.id)}</a>${pills}</td>`;
   }
   let txt = c.fmt ? c.fmt(v) : (v ?? '');
-  if (c.key === 'params' && r.paramsSrc === 'name' && txt) txt = '~' + txt;
+  if (c.key === 'params' && txt && (r.paramsSrc === 'name' || r.paramsSrc === 'files')) txt = '~' + txt;
+  if (c.key === 'ggufSize' && r.ggufSizeMax && r.ggufSizeMax !== v) txt = `${fmtBytes(v)} – ${fmtBytes(r.ggufSizeMax)}`;
   const title = c.type === 'num' && v != null ? (Number.isInteger(v) ? fmtInt(v) : v.toFixed(3)) : txt;
   return `<td class="${c.type === 'num' ? 'num' : ''}" title="${esc(title)}">${esc(txt)}</td>`;
 }
@@ -474,9 +612,8 @@ function detail(r) {
     `<a href="https://huggingface.co/models?other=base_model:quantized:${encodeURIComponent(r.id)}" target="_blank" rel="noopener">quantizations</a>` +
     `<button type="button" class="copy" data-id="${esc(r.id)}">copy id</button></div>` +
     `<dl class="detail-grid">` +
-    row('params', r.params ? (r.paramsSrc === 'name'
-      ? `~${fmtInt(r.params)} parsed from the name${r.paramsMeta ? `; Hub GGUF metadata says ${fmtInt(r.paramsMeta)}, which describes a single file in the repo (e.g. a draft/MTP or mmproj GGUF)` : '; no size metadata on the Hub'}`
-      : `${fmtInt(r.params)} (${r.paramsSrc}${dt ? ', ' + dt : ''})`) : '') +
+    row('params', paramsExplain(r)) +
+    row('files', filesExplain(r)) +
     row('architectures', r.archs.length ? esc(r.archs.join(', ')) : '') +
     row('base models', rels) +
     row('gguf', r.hasGguf ? `${fmtBytes(r.ggufSize)}${r.ctx ? ', ctx ' + fmtInt(r.ctx) : ''}` : '') +
@@ -487,6 +624,34 @@ function detail(r) {
     row('stats', `${fmtInt(r.downloads)} dl/30d · ${fmtInt(r.downloadsAllTime)} total · ${fmtInt(r.likes)} likes · trending ${fmtInt(r.trending)} · ${fmtCompact(r.dlPerDay)} dl/day · momentum ${fmtPct(r.momentum)}`) +
     row('dates', `created ${fmtDate(r.created)} · modified ${fmtDate(r.modified)} · ${Math.floor(r.ageDays ?? 0)} days old`) +
     row('tags', tags) + `</dl>`;
+}
+function paramsExplain(r) {
+  const src = r.paramsSrc, fc = r.fileCheck;
+  const metaNote = r.paramsMeta && r.paramsMeta !== r.params ? (r.hasSafetensors && !r.ggufMain.length
+    ? ` Hub safetensors metadata says ${fmtInt(r.paramsMeta)}; packed quantized weights (AWQ/GPTQ/MLX) are undercounted there.`
+    : ` Hub GGUF metadata says ${fmtInt(r.paramsMeta)}, which describes a single file in the repo (e.g. a draft/MTP or mmproj GGUF).`) : '';
+  if (!r.params) return src ? '' : 'unknown; no size metadata, no size in the name' + (r.ggufMain.length ? ', read the GGUF header below' : '');
+  if (src === 'header') return `<b>${fmtInt(r.params)}</b> exact, from the GGUF header of <code>${esc(basename(fc.header.file))}</code> (${fmtInt(fc.header.nTensors)} tensors${fc.header.sizeLabel ? ', size label ' + esc(fc.header.sizeLabel) : ''}${fc.header.fileType ? ', ' + esc(fc.header.fileType) : ''}${fc.header.expertCount ? ', ' + fc.header.expertCount + ' experts' : ''}).${metaNote}`;
+  if (src === 'files') return `~${fmtInt(r.params)} estimated from the ${esc(fc.estFrom)} file size at ${bpwFor(fc.estFrom)} bits/weight.${metaNote}`;
+  if (src === 'name') return `~${fmtInt(r.params)} parsed from the name.${metaNote || ' No size metadata on the Hub.'}`;
+  const dt = r.dtypes.length ? ', ' + r.dtypes.join(', ') : '';
+  return `${fmtInt(r.params)} (${src}${dt})`;
+}
+function filesExplain(r) {
+  const fc = r.fileCheck;
+  let html = '';
+  if (fc && fc.checkedAt) {
+    const rows = Object.entries(fc.quants).sort((a, b) => b[1] - a[1]).map(([q, b]) => `<tr><td>${esc(q)}</td><td class="num">${fmtBytes(b)}</td></tr>`).join('');
+    html += `repo ${fmtBytes(fc.totalBytes)} in ${fc.nFiles} files` + (fc.stBytes ? ` · safetensors weights ${fmtBytes(fc.stBytes)}` : '') + (fc.auxBytes ? ` · auxiliary GGUF (mmproj/draft) ${fmtBytes(fc.auxBytes)}` : '') +
+      (rows ? `<table class="files">${rows}</table>` : '');
+  } else {
+    if (r.quants.length) html += `GGUF quants: ${r.quants.map((q) => `<span class="tag">${esc(q)}</span>`).join('')}`;
+    if (r.ggufAux.length) html += `<div class="muted">auxiliary GGUF: ${r.ggufAux.map((f) => esc(basename(f))).join(', ')}</div>`;
+    html += `<div class="muted">${r.files.length} files listed</div>`;
+  }
+  const btns = (fc && fc.checkedAt ? '' : `<button type="button" class="act" data-act="check" data-id="${esc(r.id)}">check files (sizes)</button>`) +
+    (r.ggufMain.length && !(fc && fc.header) ? `<button type="button" class="act" data-act="header" data-id="${esc(r.id)}">read GGUF header (exact params, ~4–12 MB)</button>` : '');
+  return html + (btns ? `<div>${btns}<span class="act-msg"></span></div>` : '');
 }
 function renderTable() {
   renderHead();
@@ -638,6 +803,15 @@ function init() {
     if (e.target.closest('a')) return;
     const cp = e.target.closest('button.copy');
     if (cp) { navigator.clipboard?.writeText(cp.dataset.id); cp.textContent = 'copied'; return; }
+    const act = e.target.closest('button.act');
+    if (act) {
+      const r = state.rows.find((x) => x.id === act.dataset.id); if (!r) return;
+      act.disabled = true; act.textContent = act.dataset.act === 'check' ? 'checking…' : 'reading header…';
+      (act.dataset.act === 'check' ? checkFiles(r) : readHeader(r))
+        .then(() => { apply(); updateCacheInfo(); })
+        .catch((err) => { act.disabled = false; act.textContent = 'retry'; const m = act.parentElement.querySelector('.act-msg'); if (m) { m.textContent = ' ' + err.message; m.className = 'act-msg err'; } });
+      return;
+    }
     const tr = e.target.closest('tr.row'); if (!tr) return;
     const id = tr.dataset.id;
     if (state.open.has(id)) state.open.delete(id); else state.open.add(id);
@@ -655,6 +829,7 @@ function init() {
     if (e.target.checked) state.cols.add(k); else state.cols.delete(k);
     renderTable(); syncUrl();
   });
+  $('checkFiles').addEventListener('click', checkFilesBatch);
   $('exportCsv').addEventListener('click', () => exportRows('csv'));
   $('exportJson').addEventListener('click', () => exportRows('json'));
   $('copyLink').addEventListener('click', async (e) => {

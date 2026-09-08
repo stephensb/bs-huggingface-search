@@ -90,3 +90,9 @@ tr.detail td { white-space: normal; background: var(--sel); padding: 8px 12px 10
   .layout { flex-direction: column; }
   .sidebar { width: auto; max-height: 40vh; border-right: 0; border-bottom: 1px solid var(--line); }
 }
+
+.detail-grid table.files { border-collapse: collapse; font-size: 11px; width: auto; min-width: 0; }
+.detail-grid table.files td { padding: 1px 8px 1px 0; border: 0; white-space: nowrap; }
+.detail-grid table.files td.num { text-align: right; }
+.detail-grid button { font-size: 11px; padding: 2px 6px; margin-right: 6px; }
+.detail-grid .err { color: var(--bad); }

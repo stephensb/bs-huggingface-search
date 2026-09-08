@@ -135,6 +135,7 @@
         <summary>columns</summary>
         <div id="colPicker" class="dropdown-body"></div>
       </details>
+      <button type="button" id="checkFiles" title="Fetch the file tree of every filtered model that has not been checked yet (one API request each) to get real weight sizes, GGUF quant variants and a size-based parameter estimate">check files</button>
       <button type="button" id="exportCsv">CSV</button>
       <button type="button" id="exportJson">JSON</button>
       <button type="button" id="copyLink" title="Copy a URL that restores this fetch + filter + sort state">copy link</button>
@@ -147,10 +148,11 @@
     </table>
   </div>
   <div class="pager" id="pager"></div>
-  <p class="hint footer">Click a column to sort, shift-click to add a secondary sort. Click a row to expand it. Ratios like <em>momentum</em> = 30-day downloads ÷ all-time downloads; <em>dl/day</em> = all-time downloads ÷ days since creation.</p>
+  <p class="hint footer">Click a column to sort, shift-click to add a secondary sort. Click a row to expand it; from there you can read the GGUF header of the real weights file for an exact parameter count. Ratios like <em>momentum</em> = 30-day downloads ÷ all-time downloads; <em>dl/day</em> = all-time downloads ÷ days since creation.</p>
 </main>
 </div>
 
+<script src="gguf.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

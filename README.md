@@ -52,13 +52,34 @@ Nulls always sort last. Derived columns worth trying:
 Use the **columns** menu to show hidden ones (author, library, quant, gguf ctx, gguf size,
 providers, base model, relation, age).
 
+## Checking the actual model files
+
+The Hub's own GGUF metadata describes one file per repo and often lands on a draft or
+projector file, so the app can look at the real files in three increasingly precise ways:
+
+1. **File names** come with every fetch. They identify the main weight files versus
+   auxiliary GGUFs (mmproj, draft/MTP heads), list the quant variants present (facet
+   "gguf quant available", column "gguf quants") and flag vision projectors.
+2. **check files** (toolbar) fetches the file tree with sizes for every filtered model
+   that has not been checked yet, up to 300 per click with four requests in flight. It
+   yields the real size of each quant, total repo size, and a parameter estimate from the
+   highest-precision file's size and its bits-per-weight (shown with `~`). Results are
+   cached per model and revision. The same button in an expanded row checks one model.
+3. **read GGUF header** (expanded row) range-reads the header of the smallest main GGUF
+   file, which lists every tensor's dimensions, and computes the exact parameter count
+   plus architecture, context length and expert count. It costs roughly 4 to 12 MB per
+   model because the tokenizer vocabulary lives in the header, so it is per-model only.
+   Gated repos cannot be read this way without a token.
+
+Safetensors metadata from the Hub is exact and is never overridden.
+
 ## Local cache
 
 Every fetch is stored in the browser's IndexedDB, keyed by the exact fetch options.
 Pressing **Fetch** with options that were fetched before loads the stored result
 instantly (also offline) and the status line shows how old it is; press **refresh** to
 bypass the cache and pull current numbers. The 25 most recent queries are kept, and the
-status line offers **clear** to drop them all.
+status line offers **clear** to drop them all, together with the file checks.
 
 The cache works when the page is opened as a local file in Chrome and Firefox. Chrome
 shares one storage area between all local files, so other local HTML pages could read or
