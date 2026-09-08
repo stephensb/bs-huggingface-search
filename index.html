@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HF Model Explorer</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">HF Model Explorer</div>
+  <form id="fetchForm" class="fetchbar" autocomplete="off">
+    <input id="f_search" type="search" placeholder="Search models (name, e.g. qwen3 coder)" class="grow">
+    <input id="f_author" type="text" placeholder="author" size="12" title="Exact author / org, e.g. Qwen">
+    <select id="f_pipeline" title="Pipeline task">
+      <option value="">any task</option>
+    </select>
+    <select id="f_library" title="Library">
+      <option value="">any library</option>
+    </select>
+    <input id="f_filter" type="text" placeholder="tags: gguf, license:mit" size="20" title="Comma-separated tags that must all be present (server-side)">
+    <select id="f_sort" title="Server-side ordering: which slice of the Hub gets fetched">
+      <option value="downloads">top by downloads (30d)</option>
+      <option value="likes">top by likes</option>
+      <option value="trendingScore">top by trending</option>
+      <option value="createdAt">newest created</option>
+      <option value="lastModified">recently modified</option>
+    </select>
+    <select id="f_limit" title="How many models to pull in (1000 per request)">
+      <option value="500">500</option>
+      <option value="1000" selected>1000</option>
+      <option value="2000">2000</option>
+      <option value="3000">3000</option>
+      <option value="5000">5000</option>
+      <option value="10000">10000</option>
+    </select>
+    <label class="chk" title="Fetch config.json metadata (architecture, model_type). Adds ~60% to payload."><input id="f_config" type="checkbox" checked> arch</label>
+    <label class="chk" title="Only repos with GGUF files (server-side)"><input id="f_gguf" type="checkbox"> gguf</label>
+    <label class="chk" title="Only models served by at least one inference provider (server-side)"><input id="f_inference" type="checkbox"> hosted</label>
+    <button type="submit" id="fetchBtn" class="primary" title="Load results (served from the local cache when this exact query was fetched before)">Fetch</button>
+    <button type="button" id="refreshBtn" title="Bypass the cache and refetch from the Hub">refresh</button>
+    <button type="button" id="cancelBtn" hidden>Cancel</button>
+  </form>
+  <div class="status"><span id="status"></span> <span id="cacheInfo" class="muted"></span></div>
+</header>
+
+<div class="layout">
+<aside class="sidebar">
+  <div class="side-head">
+    <strong>Filters</strong>
+    <span id="filterCount" class="muted"></span>
+    <button type="button" id="resetFilters" class="link">reset</button>
+  </div>
+
+  <details open>
+    <summary>Name</summary>
+    <label>include <span class="hint">regex</span><input id="c_nameInc" type="text" placeholder="e.g. instruct|chat"></label>
+    <label>exclude <span class="hint">regex</span><input id="c_nameExc" type="text" placeholder="e.g. gguf|awq|gptq"></label>
+  </details>
+
+  <details open>
+    <summary>Size &amp; numbers</summary>
+    <div class="row2">
+      <label>params ≥ <span class="hint">B</span><input id="c_pMin" type="number" step="any" min="0" placeholder="0"></label>
+      <label>params ≤ <span class="hint">B</span><input id="c_pMax" type="number" step="any" min="0" placeholder="∞"></label>
+    </div>
+    <label class="chk"><input id="c_pUnknown" type="checkbox" checked> keep models with unknown size</label>
+    <div class="row2">
+      <label>downloads 30d ≥<input id="c_dlMin" type="number" min="0" placeholder="0"></label>
+      <label>downloads total ≥<input id="c_dlAllMin" type="number" min="0" placeholder="0"></label>
+    </div>
+    <div class="row2">
+      <label>likes ≥<input id="c_likesMin" type="number" min="0" placeholder="0"></label>
+      <label>trending ≥<input id="c_trendMin" type="number" min="0" placeholder="0"></label>
+    </div>
+    <div class="row2">
+      <label>gguf ctx ≥ <span class="hint">tokens</span><input id="c_ctxMin" type="number" min="0" placeholder="0"></label>
+      <label>providers ≥<input id="c_provMin" type="number" min="0" placeholder="0"></label>
+    </div>
+  </details>
+
+  <details open>
+    <summary>Dates</summary>
+    <div class="row2">
+      <label>created after<input id="c_createdAfter" type="date"></label>
+      <label>created before<input id="c_createdBefore" type="date"></label>
+    </div>
+    <div class="row2">
+      <label>modified after<input id="c_modAfter" type="date"></label>
+      <label>modified before<input id="c_modBefore" type="date"></label>
+    </div>
+    <div class="quick">
+      created in last
+      <button type="button" data-days="7">7d</button>
+      <button type="button" data-days="30">30d</button>
+      <button type="button" data-days="90">90d</button>
+      <button type="button" data-days="365">1y</button>
+    </div>
+  </details>
+
+  <details open>
+    <summary>Flags</summary>
+    <div class="row2">
+      <label>gated<select id="c_gated"><option value="">any</option><option value="no">not gated</option><option value="yes">gated</option></select></label>
+      <label>quantized<select id="c_quant"><option value="">any</option><option value="no">full precision only</option><option value="yes">quantized only</option></select></label>
+    </div>
+    <div class="row2">
+      <label>safetensors<select id="c_st"><option value="">any</option><option value="yes">has</option><option value="no">none</option></select></label>
+      <label>gguf files<select id="c_gg"><option value="">any</option><option value="yes">has</option><option value="no">none</option></select></label>
+    </div>
+    <div class="row2">
+      <label>derived from base<select id="c_relation"><option value="">any</option><option value="none">original (no base model)</option><option value="any">any derivative</option><option value="finetune">finetune</option><option value="quantized">quantized</option><option value="adapter">adapter</option><option value="merge">merge</option></select></label>
+      <label>custom code<select id="c_customCode"><option value="">any</option><option value="no">no</option><option value="yes">yes</option></select></label>
+    </div>
+    <label class="chk"><input id="c_live" type="checkbox"> has a live inference provider</label>
+  </details>
+
+  <details open>
+    <summary>Tags</summary>
+    <label>must have all <span class="hint">comma-separated</span><input id="c_tagsInc" type="text" placeholder="e.g. conversational, en"></label>
+    <label>must have none <span class="hint">comma-separated</span><input id="c_tagsExc" type="text" placeholder="e.g. merge, roleplay"></label>
+  </details>
+
+  <div id="facets"></div>
+</aside>
+
+<main class="main">
+  <div class="toolbar">
+    <div id="summary" class="summary">No data yet. Set the fetch options above and press Fetch.</div>
+    <div class="toolbar-right">
+      <label>rows/page
+        <select id="pageSize"><option>50</option><option selected>100</option><option>250</option><option>500</option><option>1000</option></select>
+      </label>
+      <details class="dropdown">
+        <summary>columns</summary>
+        <div id="colPicker" class="dropdown-body"></div>
+      </details>
+      <button type="button" id="exportCsv">CSV</button>
+      <button type="button" id="exportJson">JSON</button>
+      <button type="button" id="copyLink" title="Copy a URL that restores this fetch + filter + sort state">copy link</button>
+    </div>
+  </div>
+  <div class="tablewrap">
+    <table id="grid">
+      <thead><tr id="headRow"></tr></thead>
+      <tbody id="body"></tbody>
+    </table>
+  </div>
+  <div class="pager" id="pager"></div>
+  <p class="hint footer">Click a column to sort, shift-click to add a secondary sort. Click a row to expand it. Ratios like <em>momentum</em> = 30-day downloads ÷ all-time downloads; <em>dl/day</em> = all-time downloads ÷ days since creation.</p>
+</main>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
